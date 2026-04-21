@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -51,13 +52,25 @@ def _get_cookies() -> list:
 
 # ── Hyperliquid ───────────────────────────────────────────────────────────────
 def fetch_positions():
-    resp = requests.post(
-        HL_API,
-        json={"type": "clearinghouseState", "user": VAULT_ADDRESS},
-        headers={"Content-Type": "application/json"},
-        timeout=15,
-    )
-    resp.raise_for_status()
+    # Retry up to 5 times with exponential backoff for rate limit responses
+    delays = [5, 15, 30, 60, 120]
+    for attempt, delay in enumerate(delays, 1):
+        resp = requests.post(
+            HL_API,
+            json={"type": "clearinghouseState", "user": VAULT_ADDRESS},
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        if resp.status_code == 429:
+            if attempt < len(delays):
+                print(f"Rate limited by Hyperliquid (attempt {attempt}). Retrying in {delay}s...")
+                time.sleep(delay)
+                continue
+            else:
+                resp.raise_for_status()
+        resp.raise_for_status()
+        break
+
     data = resp.json()
 
     margin      = data.get("marginSummary", {})
@@ -176,4 +189,4 @@ def run_job():
 
     except Exception as e:
         print(f"ERROR: {e}")
-        raise
+        # Do not re-raise — let runner.py continue to the sleep loop
