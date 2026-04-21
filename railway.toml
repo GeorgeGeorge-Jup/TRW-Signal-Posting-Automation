@@ -2,5 +2,7 @@
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# 00:10 UTC daily (10 minutes after daily close)
-cronSchedule = "10 0 * * *"
+# No cronSchedule — the process manages its own schedule via runner.py
+# Railway treats this as a persistent worker service
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
