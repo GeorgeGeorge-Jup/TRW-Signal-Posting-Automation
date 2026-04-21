@@ -27,27 +27,29 @@ COIN_EMOJI = {
 
 DIVIDER = "───── ⋆⋅☆⋅⋆ ─────"
 
-# ── Cookie safety ─────────────────────────────────────────────────────────────
-# Loaded once at module import, purged from environment immediately.
-# Kept in memory as a string so the scheduler can reuse it across runs
-# without re-reading the environment (which has already been wiped).
+# ── Auth safety ──────────────────────────────────────────────────────────────
+# TRW authenticates via localStorage (not cookies).
+# The rauth value is loaded once at import, purged from environment immediately,
+# and kept in memory as a string for reuse across scheduled runs.
 
-_COOKIES_RAW: str = os.environ.get("TRW_COOKIES", "")
-os.environ.pop("TRW_COOKIES", None)  # purge immediately — never appears in logs again
+_RAUTH_RAW: str = os.environ.get("TRW_RAUTH", "")
+os.environ.pop("TRW_RAUTH", None)  # purge immediately — never appears in logs again
 
-def _get_cookies() -> list:
-    if not _COOKIES_RAW:
+def _get_rauth() -> str:
+    if not _RAUTH_RAW:
         raise EnvironmentError(
-            "TRW_COOKIES environment variable is not set. "
+            "TRW_RAUTH environment variable is not set. "
             "Set it in Railway -> Service -> Variables."
         )
+    # Validate it parses as JSON (it should be a JSON object string)
     try:
-        return json.loads(_COOKIES_RAW)
+        json.loads(_RAUTH_RAW)
     except json.JSONDecodeError:
         raise ValueError(
-            "TRW_COOKIES is not valid JSON. "
-            "Re-export from Cookie-Editor and paste the full array."
+            "TRW_RAUTH is not valid JSON. "
+            "Copy the exact value of the rauth key from localStorage."
         )
+    return _RAUTH_RAW
 
 
 # ── Hyperliquid ───────────────────────────────────────────────────────────────
@@ -128,7 +130,7 @@ def format_message(positions, cash_pct):
 
 
 # ── TRW poster ────────────────────────────────────────────────────────────────
-def post_to_trw(message, cookies):
+def post_to_trw(message, rauth):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -138,20 +140,23 @@ def post_to_trw(message, cookies):
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        context.add_cookies(cookies)
-        cookies.clear()
-
         page = context.new_page()
         page.on("console", lambda _: None)
 
+        # Navigate to the domain first so we can write to localStorage
+        print("Injecting auth into localStorage...")
+        page.goto("https://app.jointherealworld.com", wait_until="commit", timeout=30_000)
+        page.evaluate(f"localStorage.setItem('rauth', {json.dumps(rauth)})")
+
+        # Now navigate to the channel — app will read localStorage and authenticate
         print("Navigating to channel...")
         page.goto(CHANNEL_URL, wait_until="networkidle", timeout=40_000)
 
         if "/login" in page.url or "/auth" in page.url:
             browser.close()
             raise RuntimeError(
-                "TRW redirected to login -- session cookies have expired. "
-                "Re-export your cookies and update TRW_COOKIES in Railway."
+                "TRW redirected to login -- rauth token has expired. "
+                "Copy a fresh rauth value from localStorage and update TRW_RAUTH in Railway."
             )
 
         selector = f'[id="{INPUT_ID}"]'
@@ -173,8 +178,8 @@ def run_job():
     print(f"Job started -- {datetime.utcnow().isoformat()}")
 
     try:
-        cookies = _get_cookies()
-        print("Cookies loaded securely.")
+        rauth = _get_rauth()
+        print("Auth loaded securely.")
 
         positions, cash_pct = fetch_positions()
         print(f"Found {len(positions)} open position(s). Cash: {cash_pct:.1f}%")
@@ -184,7 +189,7 @@ def run_job():
         print(message)
         print("\n-- Posting to TRW --")
 
-        post_to_trw(message, cookies)
+        post_to_trw(message, rauth)
         print(f"Done -- {datetime.utcnow().isoformat()}")
 
     except Exception as e:
