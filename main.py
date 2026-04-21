@@ -27,22 +27,26 @@ COIN_EMOJI = {
 DIVIDER = "───── ⋆⋅☆⋅⋆ ─────"
 
 # ── Cookie safety ─────────────────────────────────────────────────────────────
-def _load_cookies_safely():
-    raw = os.environ.get("TRW_COOKIES", "")
-    if not raw:
+# Loaded once at module import, purged from environment immediately.
+# Kept in memory as a string so the scheduler can reuse it across runs
+# without re-reading the environment (which has already been wiped).
+
+_COOKIES_RAW: str = os.environ.get("TRW_COOKIES", "")
+os.environ.pop("TRW_COOKIES", None)  # purge immediately — never appears in logs again
+
+def _get_cookies() -> list:
+    if not _COOKIES_RAW:
         raise EnvironmentError(
             "TRW_COOKIES environment variable is not set. "
             "Set it in Railway -> Service -> Variables."
         )
     try:
-        cookies = json.loads(raw)
+        return json.loads(_COOKIES_RAW)
     except json.JSONDecodeError:
         raise ValueError(
             "TRW_COOKIES is not valid JSON. "
             "Re-export from Cookie-Editor and paste the full array."
         )
-    os.environ.pop("TRW_COOKIES", None)
-    return cookies
 
 
 # ── Hyperliquid ───────────────────────────────────────────────────────────────
@@ -86,20 +90,15 @@ def fetch_positions():
 
 # ── Message formatter ─────────────────────────────────────────────────────────
 def format_message(positions, cash_pct):
-    # Position lines
     position_lines = []
     for p in positions:
-        emoji     = COIN_EMOJI.get(p["coin"], "⚪")
-        direction = p["direction"]
-        line = f"- **{p['weight']:.1f}% {p['coin']} {direction}** {emoji}"
-        position_lines.append(line)
-
-    # Always append cash line
+        emoji = COIN_EMOJI.get(p["coin"], "⚪")
+        position_lines.append(f"- **{p['weight']:.1f}% {p['coin']} {p['direction']}** {emoji}")
     position_lines.append(f"- **{cash_pct:.1f}% CASH** {COIN_EMOJI['CASH']}")
 
     positions_block = "\n".join(position_lines)
 
-    message = (
+    return (
         f"⚡ **Portfolio Signal Update** ⚡\n\n"
         f"{DIVIDER}\n\n"
         f"📈 **RSPS Signal:** 📈\n"
@@ -113,8 +112,6 @@ def format_message(positions, cash_pct):
         f"(https://app.jointherealworld.com/chat/01GGDHGV32QWPG7FJ3N39K4FME/01H83QAX979K9R7QTMH74ATR8C/01JJV933W0GBNX0TXBCGFESJG9) "
         f"https://app.jointherealworld.com/lesson/BqkUG0Vh?server=01GGDHGV32QWPG7FJ3N39K4FME"
     )
-
-    return message
 
 
 # ── TRW poster ────────────────────────────────────────────────────────────────
@@ -157,19 +154,26 @@ def post_to_trw(message, cookies):
         browser.close()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    cookies = _load_cookies_safely()
-    print("Cookies loaded securely.")
+# ── Job (called by runner) ────────────────────────────────────────────────────
+def run_job():
+    print(f"\n{'='*50}")
+    print(f"Job started -- {datetime.utcnow().isoformat()}")
 
-    print("-- Fetching vault positions --")
-    positions, cash_pct = fetch_positions()
-    print(f"Found {len(positions)} open position(s). Cash: {cash_pct:.1f}%")
+    try:
+        cookies = _get_cookies()
+        print("Cookies loaded securely.")
 
-    message = format_message(positions, cash_pct)
-    print("\n-- Message preview --")
-    print(message)
-    print("\n-- Posting to TRW --")
+        positions, cash_pct = fetch_positions()
+        print(f"Found {len(positions)} open position(s). Cash: {cash_pct:.1f}%")
 
-    post_to_trw(message, cookies)
-    print(f"Done -- {datetime.utcnow().isoformat()}")
+        message = format_message(positions, cash_pct)
+        print("\n-- Message preview --")
+        print(message)
+        print("\n-- Posting to TRW --")
+
+        post_to_trw(message, cookies)
+        print(f"Done -- {datetime.utcnow().isoformat()}")
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        raise
