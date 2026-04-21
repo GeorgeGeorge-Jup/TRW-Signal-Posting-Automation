@@ -1,0 +1,6 @@
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# 00:10 UTC daily (10 minutes after daily close)
+cronSchedule = "10 0 * * *"
