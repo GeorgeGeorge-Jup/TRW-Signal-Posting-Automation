@@ -10,4 +10,4 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD ["python", "main.py"]
+CMD ["python", "main.py", "--run-now"]
