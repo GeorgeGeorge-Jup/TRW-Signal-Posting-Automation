@@ -4,10 +4,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Chromium is pre-installed in this base image
 RUN playwright install chromium
 
 COPY . .
 
-CMD ["python", "main.py", "--run-now"]
+CMD ["python", "runner.py"]
