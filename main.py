@@ -77,9 +77,6 @@ def fetch_positions():
 
     margin      = data.get("marginSummary", {})
     account_val = float(margin.get("accountValue", 0))
-    margin_used = float(margin.get("totalMarginUsed", 0))
-
-    cash_pct = ((account_val - margin_used) / account_val * 100) if account_val > 0 else 100.0
 
     raw = []
     for item in data.get("assetPositions", []):
@@ -95,10 +92,12 @@ def fetch_positions():
 
     raw.sort(key=lambda x: x["notional"], reverse=True)
 
-    total_notional = sum(p["notional"] for p in raw)
-    deployed_pct   = 100.0 - cash_pct
+    # Weight = position notional as % of total account equity (NAV).
+    # Cash = whatever equity is not deployed into positions.
     for p in raw:
-        p["weight"] = (p["notional"] / total_notional * deployed_pct) if total_notional else 0
+        p["weight"] = (p["notional"] / account_val * 100) if account_val else 0
+
+    cash_pct = max(0.0, 100.0 - sum(p["weight"] for p in raw))
 
     return raw, cash_pct
 
@@ -165,7 +164,17 @@ def post_to_trw(message, rauth):
 
         input_el = page.locator(selector)
         input_el.click()
-        page.keyboard.type(message, delay=15)
+
+        # Type line by line, using Shift+Enter for line breaks.
+        # Plain Enter would submit the message mid-way through.
+        lines = message.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                page.keyboard.type(line, delay=10)
+            if i < len(lines) - 1:
+                page.keyboard.press("Shift+Enter")
+
+        # Final Enter submits the complete message
         page.keyboard.press("Enter")
 
         page.wait_for_timeout(3_000)
