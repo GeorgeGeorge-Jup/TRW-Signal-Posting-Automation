@@ -7,8 +7,8 @@ from playwright.sync_api import sync_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VAULT_ADDRESS = "0xce508465b243216fcf372d3146fd62e8f7a7b8e2"
-CHANNEL_URL   = "https://app.jointherealworld.com/chat/01GGDHGV32QWPG7FJ3N39K4FME/01GHJ1FA8N3DT7CFKXCB191WEY"
-INPUT_ID      = "01GHJ1FA8N3DT7CFKXCB191WEY-input"
+CHANNEL_URL   = "https://app.jointherealworld.com/chat/01GGDHGV32QWPG7FJ3N39K4FME/01H83QAX979K9R7QTMH74ATR8C"
+INPUT_ID      = "01H83QAX979K9R7QTMH74ATR8C-input"
 HL_API        = "https://api.hyperliquid.xyz/info"
 
 # ── Coin emojis ───────────────────────────────────────────────────────────────
