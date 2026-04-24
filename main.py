@@ -115,7 +115,7 @@ def format_message(positions, cash_pct):
     return (
         f"⚡ **Portfolio Signal Update** ⚡\n\n"
         f"{DIVIDER}\n\n"
-        f"📈 **RSPS Signal:** 📈\n"
+        f"📈 **Gold Enhanced RSPS Signal:** 📈\n"
         f"{positions_block}\n\n"
         f"{DIVIDER}\n\n"
         f"Executive Summary: - Positions will continue to be actively managed. "
