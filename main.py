@@ -313,7 +313,7 @@ def post_to_trw(message: str):
 
         # Navigate to TRW first (need a page load before setting localStorage)
         page.goto("https://app.jointherealworld.com", wait_until="domcontentloaded", timeout=30000)
-        page.evaluate(f'window.localStorage.setItem("rauth", "{rauth}")')
+        page.evaluate("(token) => window.localStorage.setItem('rauth', token)", rauth)
 
         # Now navigate to the channel
         page.goto(TRW_CHANNEL_URL, wait_until="domcontentloaded", timeout=30000)
