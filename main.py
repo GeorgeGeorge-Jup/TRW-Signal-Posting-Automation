@@ -235,6 +235,16 @@ def format_message(positions, cash_pct):
 
 
 # ── TRW poster ────────────────────────────────────────────────────────────────
+def _get_input_text(input_el) -> str:
+    """
+    Read the current text content of the chat input element via the DOM.
+    inner_text() is unreliable for contenteditable divs in headless mode —
+    it can return "" even when the element has content, producing false positives.
+    Reading textContent directly via JS is the reliable alternative.
+    """
+    return input_el.evaluate("el => el.textContent || el.value || ''")
+
+
 def post_to_trw(message, rauth):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -267,7 +277,13 @@ def post_to_trw(message, rauth):
         page.wait_for_selector(selector, timeout=20_000)
 
         input_el = page.locator(selector)
+
+        # click() alone is not always sufficient to capture keyboard focus in
+        # headless mode, especially when a background thread (the HTTP server)
+        # is running. Calling focus() explicitly after click() guarantees that
+        # subsequent page.keyboard.type() calls land in the right element.
         input_el.click()
+        input_el.focus()
 
         lines = message.split("\n")
         for i, line in enumerate(lines):
@@ -276,19 +292,36 @@ def post_to_trw(message, rauth):
             if i < len(lines) - 1:
                 page.keyboard.press("Shift+Enter")
 
-        # Final Enter submits the complete message
+        # ── Pre-send sanity check ─────────────────────────────────────────────
+        # Verify that content was actually typed into the input before we send.
+        # If this is empty it means focus was never captured and the typing went
+        # nowhere — catching it here surfaces a clear error instead of silently
+        # "succeeding" with a blank submit.
+        pre_send = _get_input_text(input_el)
+        if not pre_send.strip():
+            browser.close()
+            raise RuntimeError(
+                "Input box is empty before sending — keyboard focus was never captured. "
+                "The message was NOT sent. Check that INPUT_ID is still correct and "
+                "that the page loaded fully."
+            )
+        print(f"Pre-send check passed — {len(pre_send)} chars staged in input.")
+
+        # Submit
         page.keyboard.press("Enter")
 
-        # Verify the input box cleared — if it did, message was sent.
-        # If it still has content after 5s, the session is stale.
+        # ── Post-send verification ────────────────────────────────────────────
+        # Wait for the chat framework to clear the input, then confirm via the
+        # DOM (not inner_text(), which is unreliable for contenteditable divs).
         page.wait_for_timeout(5_000)
-        remaining = input_el.inner_text()
+        remaining = _get_input_text(input_el)
         if remaining.strip():
             browser.close()
             raise RuntimeError(
                 "Message input still contains text after send — "
                 "message likely NOT delivered. Refresh TRW_RAUTH in Railway."
             )
+
         print("Message delivered successfully — input box cleared.")
         browser.close()
 
