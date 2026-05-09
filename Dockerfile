@@ -11,4 +11,4 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD ["python", "runner.py"]
+CMD ["python", "main.py"]
