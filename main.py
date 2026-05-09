@@ -276,8 +276,20 @@ def post_to_trw(message, rauth):
             if i < len(lines) - 1:
                 page.keyboard.press("Shift+Enter")
 
+        # Final Enter submits the complete message
         page.keyboard.press("Enter")
-        page.wait_for_timeout(3_000)
+
+        # Verify the input box cleared — if it did, message was sent.
+        # If it still has content after 5s, the session is stale.
+        page.wait_for_timeout(5_000)
+        remaining = input_el.inner_text()
+        if remaining.strip():
+            browser.close()
+            raise RuntimeError(
+                "Message input still contains text after send — "
+                "message likely NOT delivered. Refresh TRW_RAUTH in Railway."
+            )
+        print("Message delivered successfully — input box cleared.")
         browser.close()
 
 
