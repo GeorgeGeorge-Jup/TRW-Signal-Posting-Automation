@@ -361,7 +361,7 @@ def run_job():
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
-def seconds_until_next_run(hour=0, minute=10):
+def seconds_until_next_run(hour=0, minute=12):
     now = datetime.now(timezone.utc)
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if target <= now:
@@ -376,7 +376,7 @@ if __name__ == "__main__":
     run_job()
 
     while True:
-        wait = seconds_until_next_run(hour=0, minute=10)
+        wait = seconds_until_next_run(hour=0, minute=12)
         print(f"Next run in {wait/3600:.2f}h ({wait:.0f}s)")
         time.sleep(wait)
         run_job()
