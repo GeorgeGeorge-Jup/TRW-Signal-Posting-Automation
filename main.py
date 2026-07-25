@@ -5,7 +5,7 @@ import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VAULT_ADDRESS = "0xce508465b243216fcf372d3146fd62e8f7a7b8e2"
@@ -245,6 +245,23 @@ def _get_input_text(input_el) -> str:
     return input_el.evaluate("el => el.textContent || el.value || ''")
 
 
+class TransientPostError(Exception):
+    """
+    A failure that happened before the message was submitted, and that a later
+    attempt has a realistic chance of getting past (page load timeouts, the
+    input element not appearing in time). Safe to retry: nothing was sent.
+    """
+
+
+class PermanentPostError(Exception):
+    """
+    A failure that retrying cannot fix, or that must not be retried because we
+    can no longer be sure whether the message went out. Expired auth is the
+    former; a post-send verification failure is the latter — re-typing the
+    message risks a duplicate post in the channel, which is worse than a miss.
+    """
+
+
 def post_to_trw(message, rauth):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -259,22 +276,45 @@ def post_to_trw(message, rauth):
         page.on("console", lambda _: None)
 
         print("Injecting auth into localStorage...")
-        page.goto("https://app.jointherealworld.com", wait_until="commit", timeout=30_000)
+        try:
+            page.goto("https://app.jointherealworld.com", wait_until="commit", timeout=30_000)
+        except PlaywrightTimeoutError as e:
+            browser.close()
+            raise TransientPostError(f"Initial page load timed out: {e}")
         page.evaluate("(token) => localStorage.setItem('rauth', token)", rauth)
 
+        # TRW is a chat SPA with long-lived websockets and background polling, so
+        # the network never reliably goes idle — waiting for "networkidle" here
+        # made navigation fail on a slow night even though the page was usable.
+        # Commit to the navigation, then let the wait for the input element below
+        # be the real readiness gate: that element existing is the only condition
+        # we actually need before typing.
         print("Navigating to channel...")
-        page.goto(CHANNEL_URL, wait_until="networkidle", timeout=40_000)
+        try:
+            page.goto(CHANNEL_URL, wait_until="domcontentloaded", timeout=40_000)
+        except PlaywrightTimeoutError as e:
+            browser.close()
+            raise TransientPostError(f"Channel navigation timed out: {e}")
 
         if "/login" in page.url or "/auth" in page.url:
             browser.close()
-            raise RuntimeError(
+            raise PermanentPostError(
                 "TRW redirected to login -- rauth token has expired. "
                 "Copy a fresh rauth value from localStorage and update TRW_RAUTH in Railway."
             )
 
         selector = f'[id="{INPUT_ID}"]'
         print("Waiting for message input...")
-        page.wait_for_selector(selector, timeout=20_000)
+        try:
+            page.wait_for_selector(selector, timeout=30_000)
+        except PlaywrightTimeoutError:
+            # The channel page was reached but never rendered the composer. Most
+            # likely still hydrating; a retry gets a fresh load.
+            browser.close()
+            raise TransientPostError(
+                f"Message input {INPUT_ID} did not appear within 30s — "
+                "page may not have finished loading. Message was NOT sent."
+            )
 
         input_el = page.locator(selector)
 
@@ -300,7 +340,7 @@ def post_to_trw(message, rauth):
         pre_send = _get_input_text(input_el)
         if not pre_send.strip():
             browser.close()
-            raise RuntimeError(
+            raise TransientPostError(
                 "Input box is empty before sending — keyboard focus was never captured. "
                 "The message was NOT sent. Check that INPUT_ID is still correct and "
                 "that the page loaded fully."
@@ -317,13 +357,45 @@ def post_to_trw(message, rauth):
         remaining = _get_input_text(input_el)
         if remaining.strip():
             browser.close()
-            raise RuntimeError(
+            # Deliberately permanent: Enter was already pressed, so we cannot
+            # tell a failed send from a slow one. Retrying risks posting the
+            # signal twice in the channel, which is worse than missing it.
+            raise PermanentPostError(
                 "Message input still contains text after send — "
-                "message likely NOT delivered. Refresh TRW_RAUTH in Railway."
+                "message likely NOT delivered. Not retrying, to avoid a double "
+                "post. Refresh TRW_RAUTH in Railway and check the channel."
             )
 
         print("Message delivered successfully — input box cleared.")
         browser.close()
+
+
+POST_ATTEMPTS = 3
+POST_BACKOFF  = (30, 60)   # seconds to wait before attempt 2, then attempt 3
+
+
+def post_to_trw_with_retry(message, rauth):
+    """
+    Post the message, retrying only failures that happened before submission.
+
+    A whole night's signal used to be lost to a single transient page load
+    failure, since the scheduler simply slept until the next day. Each attempt
+    launches a fresh browser, so a retry starts from a clean session rather
+    than a half-loaded page.
+    """
+    for attempt in range(1, POST_ATTEMPTS + 1):
+        try:
+            post_to_trw(message, rauth)
+            return
+        except TransientPostError as e:
+            if attempt == POST_ATTEMPTS:
+                raise RuntimeError(
+                    f"Posting failed after {POST_ATTEMPTS} attempts. Last error: {e}"
+                )
+            wait = POST_BACKOFF[attempt - 1]
+            print(f"Attempt {attempt}/{POST_ATTEMPTS} failed: {e}")
+            print(f"Retrying in {wait}s...")
+            time.sleep(wait)
 
 
 # ── Job ────────────────────────────────────────────────────────────────────────
@@ -351,7 +423,7 @@ def run_job():
         print(message)
         print("\n-- Posting to TRW --")
 
-        post_to_trw(message, rauth)
+        post_to_trw_with_retry(message, rauth)
         _clear_pushed_signals()
         print(f"Done -- {datetime.utcnow().isoformat()}")
 
