@@ -14,10 +14,9 @@ INPUT_ID      = "01H83QAX979K9R7QTMH74ATR8C-input"
 HL_API        = "https://api.hyperliquid.xyz/info"
 
 # ── RSPS universe ─────────────────────────────────────────────────────────────
-# Hyperliquid perps the RSPS can allocate to, keyed by perp name, with the emoji
-# shown next to each in the post. Names match Hyperliquid exactly, including the
-# "k" prefix on the 1000x-denominated perps (kPEPE, kSHIB). The xyz: builder-dex
-# perps (stocks, commodities, indices) are deliberately not part of the RSPS.
+# Hyperliquid perps the RSPS can allocate to, keyed by the name shown in the
+# post, with the emoji shown next to each. The xyz: builder-dex perps (stocks,
+# commodities, indices) are deliberately not part of the RSPS.
 COIN_EMOJI = {
     "BTC":      "🟠",
     "ETH":      "🔷",
@@ -27,7 +26,7 @@ COIN_EMOJI = {
     "LTC":      "🥈",
     "DOGE":     "🐶",
     "SUI":      "💧",
-    "kPEPE":    "🐸",
+    "PEPE":     "🐸",
     "CRV":      "🌈",
     "LINK":     "🔗",
     "XRP":      "💀",
@@ -35,7 +34,7 @@ COIN_EMOJI = {
     "AAVE":     "👻",
     "WLD":      "🌍",
     "TRX":      "🔴",
-    "kSHIB":    "🐕",
+    "SHIB":     "🐕",
     "UNI":      "🦄",
     "DOT":      "🩷",
     "ADA":      "🔵",
@@ -61,9 +60,11 @@ COIN_EMOJI = {
 
 RSPS_COINS = frozenset(COIN_EMOJI) - {"CASH"}
 
-# Case-insensitive lookup back to the canonical perp name, so a push of "KPEPE"
-# or "kpepe" still renders as kPEPE with the right emoji.
+# Case-insensitive lookup from an incoming coin name to the name shown in the post.
+# Hyperliquid prefixes its 1000x-denominated perps with "k" (kPEPE = 1000 PEPE);
+# that prefix only confuses readers, so those post as plain PEPE and SHIB.
 _CANONICAL_COIN = {c.upper(): c for c in RSPS_COINS}
+_CANONICAL_COIN.update({"KPEPE": "PEPE", "KSHIB": "SHIB"})
 
 
 def canonical_coin(coin: str) -> str:
