@@ -13,19 +13,62 @@ CHANNEL_URL   = "https://app.jointherealworld.com/chat/01GGDHGV32QWPG7FJ3N39K4FM
 INPUT_ID      = "01H83QAX979K9R7QTMH74ATR8C-input"
 HL_API        = "https://api.hyperliquid.xyz/info"
 
-# ── Coin emojis ───────────────────────────────────────────────────────────────
+# ── RSPS universe ─────────────────────────────────────────────────────────────
+# Hyperliquid perps the RSPS can allocate to, keyed by perp name, with the emoji
+# shown next to each in the post. Names match Hyperliquid exactly, including the
+# "k" prefix on the 1000x-denominated perps (kPEPE, kSHIB). The xyz: builder-dex
+# perps (stocks, commodities, indices) are deliberately not part of the RSPS.
 COIN_EMOJI = {
-    "BTC":  "🟠",
-    "ETH":  "🔷",
-    "SOL":  "🟣",
-    "SUI":  "💧",
-    "XRP":  "💀",
-    "BNB":  "🟨",
-    "DOGE": "🐶",
-    "HYPE": "🟢",
-    "PAXG": "🟡",
-    "CASH": "💵",
+    "BTC":      "🟠",
+    "ETH":      "🔷",
+    "SOL":      "🟣",
+    "AVAX":     "🔺",
+    "BNB":      "🟨",
+    "LTC":      "🥈",
+    "DOGE":     "🐶",
+    "SUI":      "💧",
+    "kPEPE":    "🐸",
+    "CRV":      "🌈",
+    "LINK":     "🔗",
+    "XRP":      "💀",
+    "APT":      "🅰️",
+    "AAVE":     "👻",
+    "WLD":      "🌍",
+    "TRX":      "🔴",
+    "kSHIB":    "🐕",
+    "UNI":      "🦄",
+    "DOT":      "🩷",
+    "ADA":      "🔵",
+    "PENDLE":   "⏳",
+    "NEAR":     "🌐",
+    "ONDO":     "🏦",
+    "TAO":      "🧠",
+    "ENA":      "💠",
+    "HYPE":     "🟢",
+    "FARTCOIN": "💨",
+    "PAXG":     "🟡",
+    "PUMP":     "💊",
+    "XPL":      "🔌",
+    "WLFI":     "🦅",
+    "ASTER":    "✳️",
+    "ZEC":      "🛡️",
+    "MON":      "👾",
+    "AERO":     "✈️",
+    "LIT":      "🔥",
+    "XMR":      "🕶️",
+    "CASH":     "💵",
 }
+
+RSPS_COINS = frozenset(COIN_EMOJI) - {"CASH"}
+
+# Case-insensitive lookup back to the canonical perp name, so a push of "KPEPE"
+# or "kpepe" still renders as kPEPE with the right emoji.
+_CANONICAL_COIN = {c.upper(): c for c in RSPS_COINS}
+
+
+def canonical_coin(coin: str) -> str:
+    return _CANONICAL_COIN.get(coin.upper(), coin)
+
 
 DIVIDER = "───── ⋆⋅☆⋅⋆ ─────"
 
@@ -212,8 +255,12 @@ def pushed_signals_to_positions(signals: dict):
 def format_message(positions, cash_pct):
     position_lines = []
     for p in positions:
-        emoji = COIN_EMOJI.get(p["coin"], "⚪")
-        position_lines.append(f"- **{p['weight']:.1f}% {p['coin']} {p['direction']}** {emoji}")
+        coin = canonical_coin(p["coin"])
+        if coin not in RSPS_COINS:
+            # Still posted, so the weights add up to 100% — just flagged in the logs.
+            print(f"WARNING: {coin} is not in the RSPS token list")
+        emoji = COIN_EMOJI.get(coin, "⚪")
+        position_lines.append(f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji}")
     position_lines.append(f"- **{cash_pct:.1f}% CASH** {COIN_EMOJI['CASH']}")
 
     positions_block = "\n".join(position_lines)
