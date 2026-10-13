@@ -396,12 +396,17 @@ def _position_line(p):
     return f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji}"
 
 
+# Shown after the coin's emoji in the net book, so the bet's direction reads at a glance.
+DIRECTION_ARROW = {"LONG": "⬆️", "SHORT": "⬇️", "FLAT": "➖"}
+
+
 def _net_line(p):
     coin, emoji = _coin_and_emoji(p["coin"])
+    arrow = DIRECTION_ARROW[p["direction"]]
     if p["direction"] == "FLAT":
-        line = f"- **0.0% {coin} FLAT** {emoji}"
+        line = f"- **0.0% {coin} FLAT** {emoji} {arrow}"
     else:
-        line = f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji}"
+        line = f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji} {arrow}"
     if p["netted"]:
         line += f" (net of {p['long']:.1f}% long and {p['short']:.1f}% short)"
     return line
