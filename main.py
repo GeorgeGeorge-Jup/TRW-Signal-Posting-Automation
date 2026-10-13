@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import time
 import threading
 import requests
@@ -98,7 +99,7 @@ def _get_rauth() -> str:
 # None = no push received yet (fall back to Hyperliquid).
 
 _signal_lock = threading.Lock()
-_pushed_signals = None   # {asset: pct, ...} e.g. {"ETH": 33.3, "SOL": 25.8, "USD": 40.9}
+_pushed_signals = None   # parse_pushed_payload() output, e.g. {"allocation": {"ETH": 33.3, "USD": 66.7}, ...}
 _push_timestamp = None
 
 def _set_pushed_signals(signals, timestamp):
@@ -164,16 +165,65 @@ class SignalReceiver(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"bad JSON: {e}"})
             return
 
-        allocation = payload.get("allocation")
-        timestamp = payload.get("timestamp", datetime.now(timezone.utc).isoformat())
-
-        if not allocation or not isinstance(allocation, dict):
-            self._send_json(400, {"error": "missing or invalid 'allocation' field"})
+        try:
+            signal = parse_pushed_payload(payload)
+        except ValueError as e:
+            print(f"Rejected signal push — {e}")
+            self._send_json(400, {"error": str(e)})
             return
 
-        _set_pushed_signals(allocation, timestamp)
-        print(f"Signals received from TV-dHEDGE bot: {allocation}")
-        self._send_json(200, {"status": "ok", "received": allocation})
+        timestamp = payload.get("timestamp", datetime.now(timezone.utc).isoformat())
+        _set_pushed_signals(signal, timestamp)
+        print(f"Signals received from TV-dHEDGE bot: {signal}")
+        self._send_json(200, {"status": "ok", "received": signal["allocation"]})
+
+
+def _pct_map(payload, key, required=False):
+    """
+    Read one {coin: pct} block of a push, or None when an optional block is
+    absent. Every value must be a finite number: a bad value is refused so the
+    job falls back to Hyperliquid instead of posting a garbled signal.
+    """
+    block = payload.get(key)
+    if block is None and not required:
+        return None
+    if not isinstance(block, dict) or (required and not block):
+        raise ValueError(f"missing or invalid '{key}' field")
+    for coin, pct in block.items():
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+            raise ValueError(f"'{key}.{coin}' is not a number: {pct!r}")
+    return dict(block)
+
+
+def parse_pushed_payload(payload):
+    """
+    Validate a push from the TV-dHEDGE bot and keep the parts the post needs.
+
+    "allocation" is the net book actually traded (negative = short) and is the
+    only required field, so the original long-only pushes still work. Pushes
+    that carry the short module (BRAS) add the two sleeves separately:
+      "longs":  the RSPS long book, percent, including USD (cash)
+      "shorts": the short module's targets, percent, negative = short
+      "bras":   short module metadata, e.g. {"mode": "live", "gross_pct": 7.12}
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+
+    signal = {
+        "allocation": _pct_map(payload, "allocation", required=True),
+        "longs":      _pct_map(payload, "longs"),
+        "shorts":     _pct_map(payload, "shorts"),
+        "bras":       payload.get("bras"),
+    }
+
+    if signal["longs"] and any(pct < 0 for pct in signal["longs"].values()):
+        raise ValueError("'longs' must not contain negative weights")
+    if signal["shorts"] and any(pct > 0 for pct in signal["shorts"].values()):
+        raise ValueError("'shorts' must not contain positive weights")
+    if signal["bras"] is not None and not isinstance(signal["bras"], dict):
+        raise ValueError("'bras' must be an object")
+
+    return signal
 
 
 def start_receiver_server():
@@ -226,50 +276,167 @@ def fetch_positions():
     for p in raw:
         p["weight"] = (p["notional"] / account_val * 100) if account_val else 0
 
-    cash_pct = max(0.0, 100.0 - sum(p["weight"] for p in raw))
+    # Shorts are a separate sleeve, not funded from cash, so only longs use it up.
+    cash_pct = max(0.0, 100.0 - sum(p["weight"] for p in raw if p["direction"] == "LONG"))
 
     return raw, cash_pct
 
 
-def pushed_signals_to_positions(signals: dict):
-    """
-    Convert a pushed allocation dict {"ETH": 33.3, "SOL": 25.8, "USD": 40.9}
-    into the same (positions, cash_pct) format that fetch_positions() returns,
-    so the rest of run_job() works unchanged.
-    """
-    cash_pct = signals.get("USD", 0)
-    positions = []
-    for coin, pct in signals.items():
-        if coin == "USD" or pct <= 0:
+# Below this a weight shows as 0.0% in the post, so a coin netted to it is flat.
+FLAT_PCT = 0.05
+
+
+def _by_coin(weights: dict) -> dict:
+    """Sum {coin: pct} by the name shown in the post (kPEPE and PEPE are one coin)."""
+    out = {}
+    for coin, pct in weights.items():
+        if coin == "USD":
             continue
-        positions.append({
-            "coin":      coin,
-            "direction": "LONG",
-            "notional":  pct,   # notional not needed for display, weight is what matters
-            "weight":    pct,
-        })
+        name = canonical_coin(coin)
+        out[name] = out.get(name, 0.0) + pct
+    return out
+
+
+def pushed_signals_to_positions(signal: dict):
+    """
+    Convert a parse_pushed_payload() signal into (positions, cash_pct,
+    short_module) for format_message().
+
+    positions/cash_pct are the RSPS long book, in the same format that
+    fetch_positions() returns. short_module is None for a long-only push, so
+    those post exactly as before; otherwise it holds the short sleeve and the
+    net book (longs and shorts on the same coin netted into one position).
+    """
+    allocation = signal["allocation"]
+    longs = signal["longs"]
+    shorts = signal["shorts"]
+    bras = signal["bras"]
+
+    # A push without the separate sleeves is a net book: its negatives are shorts.
+    if longs is None:
+        longs = {coin: pct for coin, pct in allocation.items() if pct > 0}
+    if shorts is None:
+        shorts = {coin: pct for coin, pct in allocation.items() if coin != "USD" and pct < 0}
+
+    cash_pct = longs.get("USD", allocation.get("USD", 0))
+    positions = [
+        {"coin": coin, "direction": "LONG", "notional": pct, "weight": pct}
+        for coin, pct in _by_coin(longs).items()
+        if pct > 0
+    ]
     positions.sort(key=lambda x: x["weight"], reverse=True)
-    return positions, cash_pct
+
+    has_short_module = bras is not None or signal["shorts"] is not None or bool(shorts)
+    if not has_short_module:
+        return positions, cash_pct, None
+
+    if bras and bras.get("mode", "live") != "live":
+        # A dry-run short book is not a signal anyone should follow.
+        print(f"Short module is in {bras.get('mode')!r} mode — not posting its shorts")
+        return positions, cash_pct, None
+
+    short_by_coin = {coin: -pct for coin, pct in _by_coin(shorts).items() if pct < 0}
+    long_by_coin = {p["coin"]: p["weight"] for p in positions}
+    net_alloc = _by_coin(allocation)
+
+    short_positions = [
+        {"coin": coin, "direction": "SHORT", "notional": pct, "weight": pct}
+        for coin, pct in short_by_coin.items()
+    ]
+    short_positions.sort(key=lambda x: x["weight"], reverse=True)
+
+    net = []
+    for coin in {**long_by_coin, **short_by_coin}:
+        long_pct = long_by_coin.get(coin, 0.0)
+        short_pct = short_by_coin.get(coin, 0.0)
+        net_pct = long_pct - short_pct
+        # The pushed allocation is what is actually traded, so it wins; the
+        # sleeves should always add up to it.
+        if coin in net_alloc:
+            if abs(net_alloc[coin] - net_pct) > FLAT_PCT:
+                print(
+                    f"WARNING: {coin} net allocation {net_alloc[coin]:.2f}% does not match "
+                    f"longs {long_pct:.2f}% minus shorts {short_pct:.2f}%; posting the allocation"
+                )
+            net_pct = net_alloc[coin]
+        if abs(net_pct) < FLAT_PCT:
+            direction = "FLAT"
+        else:
+            direction = "LONG" if net_pct > 0 else "SHORT"
+        net.append({
+            "coin":      coin,
+            "direction": direction,
+            "weight":    abs(net_pct),
+            "long":      long_pct,
+            "short":     short_pct,
+            "netted":    long_pct > 0 and short_pct > 0,
+        })
+    order = {"LONG": 0, "SHORT": 1, "FLAT": 2}
+    net.sort(key=lambda x: (order[x["direction"]], -x["weight"]))
+
+    gross = sum(short_by_coin.values())
+    if bras and isinstance(bras.get("gross_pct"), (int, float)) and abs(bras["gross_pct"] - gross) > FLAT_PCT:
+        print(f"WARNING: short module gross_pct {bras['gross_pct']}% does not match its shorts ({gross:.2f}%)")
+
+    short_module = {"shorts": short_positions, "gross": gross, "net": net}
+    return positions, cash_pct, short_module
 
 
 # ── Message formatter ─────────────────────────────────────────────────────────
-def format_message(positions, cash_pct):
-    position_lines = []
-    for p in positions:
-        coin = canonical_coin(p["coin"])
-        if coin not in RSPS_COINS:
-            # Still posted, so the weights add up to 100% — just flagged in the logs.
-            print(f"WARNING: {coin} is not in the RSPS token list")
-        emoji = COIN_EMOJI.get(coin, "⚪")
-        position_lines.append(f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji}")
-    position_lines.append(f"- **{cash_pct:.1f}% CASH** {COIN_EMOJI['CASH']}")
+def _coin_and_emoji(coin):
+    coin = canonical_coin(coin)
+    if coin not in RSPS_COINS:
+        # Still posted, so the weights add up — just flagged in the logs.
+        print(f"WARNING: {coin} is not in the RSPS token list")
+    return coin, COIN_EMOJI.get(coin, "⚪")
 
-    positions_block = "\n".join(position_lines)
+
+def _position_line(p):
+    coin, emoji = _coin_and_emoji(p["coin"])
+    return f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji}"
+
+
+def _net_line(p):
+    coin, emoji = _coin_and_emoji(p["coin"])
+    if p["direction"] == "FLAT":
+        line = f"- **0.0% {coin} FLAT** {emoji}"
+    else:
+        line = f"- **{p['weight']:.1f}% {coin} {p['direction']}** {emoji}"
+    if p["netted"]:
+        line += f" (net of {p['long']:.1f}% long and {p['short']:.1f}% short)"
+    return line
+
+
+def format_message(positions, cash_pct, short_module=None):
+    """
+    Build the post. positions/cash_pct are the RSPS long book. short_module
+    (see pushed_signals_to_positions) adds the short sleeve and the netted
+    book; without it the post is the original long-only layout.
+    """
+    cash_line = f"- **{cash_pct:.1f}% CASH** {COIN_EMOJI['CASH']}"
+
+    position_lines = [_position_line(p) for p in positions]
+    position_lines.append(cash_line)
+    sections = ["📈 **RSPS Signal:** 📈\n" + "\n".join(position_lines)]
+
+    if short_module is not None:
+        if short_module["shorts"]:
+            short_lines = [_position_line(p) for p in short_module["shorts"]]
+            short_lines.append(f"- Total short exposure: **{short_module['gross']:.1f}%**")
+        else:
+            short_lines = ["- **No short positions** (flat)"]
+        sections.append("📉 **Short Module:** 📉\n" + "\n".join(short_lines))
+
+        if short_module["shorts"]:
+            net_lines = [_net_line(p) for p in short_module["net"]]
+            net_lines.append(cash_line)
+            sections.append("⚖️ **Net Positions:** ⚖️\n" + "\n".join(net_lines))
+
+    positions_block = "\n\n".join(sections)
 
     return (
         f"⚡ **Portfolio Signal Update** ⚡\n\n"
         f"{DIVIDER}\n\n"
-        f"📈 **RSPS Signal:** 📈\n"
         f"{positions_block}\n\n"
         f"{DIVIDER}\n\n"
         f"Executive Summary: - Positions will continue to be actively managed. "
@@ -459,14 +626,20 @@ def run_job():
         pushed, push_ts = _get_pushed_signals()
         if pushed is not None:
             print(f"Using pushed signals from TV-dHEDGE bot (timestamp: {push_ts})")
-            positions, cash_pct = pushed_signals_to_positions(pushed)
+            positions, cash_pct, short_module = pushed_signals_to_positions(pushed)
         else:
+            # Hyperliquid only holds the net book, so any short there is listed
+            # with the longs; the sleeves can't be told apart.
             print("No pushed signals — falling back to Hyperliquid positions")
             positions, cash_pct = fetch_positions()
+            short_module = None
 
         print(f"Found {len(positions)} open position(s). Cash: {cash_pct:.1f}%")
+        if short_module is not None:
+            print(f"Short module: {len(short_module['shorts'])} short(s), "
+                  f"{short_module['gross']:.1f}% gross")
 
-        message = format_message(positions, cash_pct)
+        message = format_message(positions, cash_pct, short_module)
         print("\n-- Message preview --")
         print(message)
         print("\n-- Posting to TRW --")
