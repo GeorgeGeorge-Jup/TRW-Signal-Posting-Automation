@@ -6,6 +6,7 @@ import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlsplit, parse_qs
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -13,6 +14,12 @@ VAULT_ADDRESS = "0xce508465b243216fcf372d3146fd62e8f7a7b8e2"
 CHANNEL_URL   = "https://app.jointherealworld.com/chat/01GGDHGV32QWPG7FJ3N39K4FME/01H83QAX979K9R7QTMH74ATR8C"
 INPUT_ID      = "01H83QAX979K9R7QTMH74ATR8C-input"
 HL_API        = "https://api.hyperliquid.xyz/info"
+
+# Where failed posts leave a screenshot and the open dialog's contents, so a
+# miss can be diagnosed after the fact. Container disk is wiped on restart or
+# redeploy; point DEBUG_DIR at a Railway volume to keep captures across those.
+DEBUG_DIR             = os.environ.get("DEBUG_DIR", "/tmp/trw-debug")
+DEBUG_RETENTION_HOURS = 48
 
 # ── RSPS universe ─────────────────────────────────────────────────────────────
 # Hyperliquid perps the RSPS can allocate to, keyed by the name shown in the
@@ -133,8 +140,41 @@ class SignalReceiver(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _authorized(self, query=None):
+        # The debug pages accept the key as ?key= too, so they open in a browser.
+        api_key = os.environ.get("SIGNAL_API_KEY", "")
+        provided = self.headers.get("x-api-key", "")
+        if not provided and query:
+            provided = query.get("key", [""])[0]
+        return bool(api_key) and provided == api_key
+
+    def _serve_debug(self, path, query):
+        if not self._authorized(query):
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        files = list_debug_captures()
+        if path in ("/debug", "/debug/"):
+            self._send_json(200, {"retention_hours": DEBUG_RETENTION_HOURS, "files": files})
+            return
+        # Only names that are actually in the capture folder are served, so a
+        # crafted path can't reach anything else on disk.
+        name = path[len("/debug/"):]
+        if name not in files:
+            self._send_json(404, {"error": "not found"})
+            return
+        with open(os.path.join(DEBUG_DIR, name), "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png" if name.endswith(".png") else "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
-        if self.path == "/health":
+        url = urlsplit(self.path)
+        if url.path == "/debug" or url.path.startswith("/debug/"):
+            self._serve_debug(url.path, parse_qs(url.query))
+        elif self.path == "/health":
             signals, ts = _get_pushed_signals()
             self._send_json(200, {
                 "status": "ok",
@@ -465,6 +505,61 @@ def _get_input_text(input_el) -> str:
     return input_el.evaluate("el => el.textContent || el.value || ''")
 
 
+# ── Failure captures ──────────────────────────────────────────────────────────
+def list_debug_captures():
+    """Capture files still within the retention window, newest first."""
+    if not os.path.isdir(DEBUG_DIR):
+        return []
+    cutoff = time.time() - DEBUG_RETENTION_HOURS * 3600
+    files = []
+    for name in os.listdir(DEBUG_DIR):
+        path = os.path.join(DEBUG_DIR, name)
+        if os.path.isfile(path) and os.path.getmtime(path) >= cutoff:
+            files.append(name)
+    return sorted(files, reverse=True)
+
+
+def _prune_debug_captures():
+    cutoff = time.time() - DEBUG_RETENTION_HOURS * 3600
+    for name in os.listdir(DEBUG_DIR):
+        path = os.path.join(DEBUG_DIR, name)
+        if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+            os.remove(path)
+
+
+def capture_failure(page):
+    """
+    Save a screenshot of the page and whatever is open in TRW's dialog layer,
+    and print the dialog text, so a failed post can be diagnosed afterwards.
+    Never raises: a failed capture must not hide the error that triggered it.
+    """
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        _prune_debug_captures()
+        stem = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        shot = f"{stem}_failure.png"
+        page.screenshot(path=os.path.join(DEBUG_DIR, shot), full_page=True, timeout=15_000)
+
+        dialog = page.evaluate("""() => {
+            const root = document.getElementById('dialog-root');
+            return root ? {text: root.innerText, html: root.innerHTML} : null;
+        }""")
+        info = f"{stem}_failure.txt"
+        with open(os.path.join(DEBUG_DIR, info), "w", encoding="utf-8") as f:
+            f.write(f"URL: {page.url}\n\n")
+            if dialog is None:
+                f.write("No #dialog-root on the page.\n")
+            else:
+                f.write(f"Dialog text:\n{dialog['text']}\n\nDialog HTML:\n{dialog['html']}\n")
+
+        print(f"Failure capture saved: {shot}, {info} (kept {DEBUG_RETENTION_HOURS}h, "
+              "view via /debug?key=<SIGNAL_API_KEY>)")
+        if dialog and dialog["text"].strip():
+            print(f"Open dialog text: {dialog['text'].strip()[:1000]}")
+    except Exception as e:
+        print(f"Failure capture could not be saved: {e}")
+
+
 class TransientPostError(Exception):
     """
     A failure that happened before the message was submitted, and that a later
@@ -494,100 +589,102 @@ def post_to_trw(message, rauth):
         )
         page = context.new_page()
         page.on("console", lambda _: None)
-
-        print("Injecting auth into localStorage...")
         try:
-            page.goto("https://app.jointherealworld.com", wait_until="commit", timeout=30_000)
-        except PlaywrightTimeoutError as e:
+            _post_in_page(page, message, rauth)
+        except Exception:
+            capture_failure(page)
+            raise
+        finally:
             browser.close()
-            raise TransientPostError(f"Initial page load timed out: {e}")
-        page.evaluate("(token) => localStorage.setItem('rauth', token)", rauth)
 
-        # TRW is a chat SPA with long-lived websockets and background polling, so
-        # the network never reliably goes idle — waiting for "networkidle" here
-        # made navigation fail on a slow night even though the page was usable.
-        # Commit to the navigation, then let the wait for the input element below
-        # be the real readiness gate: that element existing is the only condition
-        # we actually need before typing.
-        print("Navigating to channel...")
-        try:
-            page.goto(CHANNEL_URL, wait_until="domcontentloaded", timeout=40_000)
-        except PlaywrightTimeoutError as e:
-            browser.close()
-            raise TransientPostError(f"Channel navigation timed out: {e}")
 
-        if "/login" in page.url or "/auth" in page.url:
-            browser.close()
-            raise PermanentPostError(
-                "TRW redirected to login -- rauth token has expired. "
-                "Copy a fresh rauth value from localStorage and update TRW_RAUTH in Railway."
-            )
+def _post_in_page(page, message, rauth):
+    print("Injecting auth into localStorage...")
+    try:
+        page.goto("https://app.jointherealworld.com", wait_until="commit", timeout=30_000)
+    except PlaywrightTimeoutError as e:
+        raise TransientPostError(f"Initial page load timed out: {e}")
+    page.evaluate("(token) => localStorage.setItem('rauth', token)", rauth)
 
-        selector = f'[id="{INPUT_ID}"]'
-        print("Waiting for message input...")
-        try:
-            page.wait_for_selector(selector, timeout=30_000)
-        except PlaywrightTimeoutError:
-            # The channel page was reached but never rendered the composer. Most
-            # likely still hydrating; a retry gets a fresh load.
-            browser.close()
-            raise TransientPostError(
-                f"Message input {INPUT_ID} did not appear within 30s — "
-                "page may not have finished loading. Message was NOT sent."
-            )
+    # TRW is a chat SPA with long-lived websockets and background polling, so
+    # the network never reliably goes idle — waiting for "networkidle" here
+    # made navigation fail on a slow night even though the page was usable.
+    # Commit to the navigation, then let the wait for the input element below
+    # be the real readiness gate: that element existing is the only condition
+    # we actually need before typing.
+    print("Navigating to channel...")
+    try:
+        page.goto(CHANNEL_URL, wait_until="domcontentloaded", timeout=40_000)
+    except PlaywrightTimeoutError as e:
+        raise TransientPostError(f"Channel navigation timed out: {e}")
 
-        input_el = page.locator(selector)
+    if "/login" in page.url or "/auth" in page.url:
+        raise PermanentPostError(
+            "TRW redirected to login -- rauth token has expired. "
+            "Copy a fresh rauth value from localStorage and update TRW_RAUTH in Railway."
+        )
 
-        # click() alone is not always sufficient to capture keyboard focus in
-        # headless mode, especially when a background thread (the HTTP server)
-        # is running. Calling focus() explicitly after click() guarantees that
-        # subsequent page.keyboard.type() calls land in the right element.
-        input_el.click()
-        input_el.focus()
+    selector = f'[id="{INPUT_ID}"]'
+    print("Waiting for message input...")
+    try:
+        page.wait_for_selector(selector, timeout=30_000)
+    except PlaywrightTimeoutError:
+        # The channel page was reached but never rendered the composer. Most
+        # likely still hydrating; a retry gets a fresh load.
+        raise TransientPostError(
+            f"Message input {INPUT_ID} did not appear within 30s — "
+            "page may not have finished loading. Message was NOT sent."
+        )
 
-        lines = message.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                page.keyboard.type(line, delay=10)
-            if i < len(lines) - 1:
-                page.keyboard.press("Shift+Enter")
+    input_el = page.locator(selector)
 
-        # ── Pre-send sanity check ─────────────────────────────────────────────
-        # Verify that content was actually typed into the input before we send.
-        # If this is empty it means focus was never captured and the typing went
-        # nowhere — catching it here surfaces a clear error instead of silently
-        # "succeeding" with a blank submit.
-        pre_send = _get_input_text(input_el)
-        if not pre_send.strip():
-            browser.close()
-            raise TransientPostError(
-                "Input box is empty before sending — keyboard focus was never captured. "
-                "The message was NOT sent. Check that INPUT_ID is still correct and "
-                "that the page loaded fully."
-            )
-        print(f"Pre-send check passed — {len(pre_send)} chars staged in input.")
+    # click() alone is not always sufficient to capture keyboard focus in
+    # headless mode, especially when a background thread (the HTTP server)
+    # is running. Calling focus() explicitly after click() guarantees that
+    # subsequent page.keyboard.type() calls land in the right element.
+    input_el.click()
+    input_el.focus()
 
-        # Submit
-        page.keyboard.press("Enter")
+    lines = message.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            page.keyboard.type(line, delay=10)
+        if i < len(lines) - 1:
+            page.keyboard.press("Shift+Enter")
 
-        # ── Post-send verification ────────────────────────────────────────────
-        # Wait for the chat framework to clear the input, then confirm via the
-        # DOM (not inner_text(), which is unreliable for contenteditable divs).
-        page.wait_for_timeout(5_000)
-        remaining = _get_input_text(input_el)
-        if remaining.strip():
-            browser.close()
-            # Deliberately permanent: Enter was already pressed, so we cannot
-            # tell a failed send from a slow one. Retrying risks posting the
-            # signal twice in the channel, which is worse than missing it.
-            raise PermanentPostError(
-                "Message input still contains text after send — "
-                "message likely NOT delivered. Not retrying, to avoid a double "
-                "post. Refresh TRW_RAUTH in Railway and check the channel."
-            )
+    # ── Pre-send sanity check ─────────────────────────────────────────────
+    # Verify that content was actually typed into the input before we send.
+    # If this is empty it means focus was never captured and the typing went
+    # nowhere — catching it here surfaces a clear error instead of silently
+    # "succeeding" with a blank submit.
+    pre_send = _get_input_text(input_el)
+    if not pre_send.strip():
+        raise TransientPostError(
+            "Input box is empty before sending — keyboard focus was never captured. "
+            "The message was NOT sent. Check that INPUT_ID is still correct and "
+            "that the page loaded fully."
+        )
+    print(f"Pre-send check passed — {len(pre_send)} chars staged in input.")
 
-        print("Message delivered successfully — input box cleared.")
-        browser.close()
+    # Submit
+    page.keyboard.press("Enter")
+
+    # ── Post-send verification ────────────────────────────────────────────
+    # Wait for the chat framework to clear the input, then confirm via the
+    # DOM (not inner_text(), which is unreliable for contenteditable divs).
+    page.wait_for_timeout(5_000)
+    remaining = _get_input_text(input_el)
+    if remaining.strip():
+        # Deliberately permanent: Enter was already pressed, so we cannot
+        # tell a failed send from a slow one. Retrying risks posting the
+        # signal twice in the channel, which is worse than missing it.
+        raise PermanentPostError(
+            "Message input still contains text after send — "
+            "message likely NOT delivered. Not retrying, to avoid a double "
+            "post. Refresh TRW_RAUTH in Railway and check the channel."
+        )
+
+    print("Message delivered successfully — input box cleared.")
 
 
 POST_ATTEMPTS = 3
